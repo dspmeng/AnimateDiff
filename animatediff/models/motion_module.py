@@ -241,6 +241,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
+        # to test more than 32 frames, just use x = x.
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 

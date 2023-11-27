@@ -391,6 +391,16 @@ class AnimationPipeline(DiffusionPipeline):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
+                #if i == 0:
+                #    print(self.unet)
+                #    import torchinfo
+                #    torchinfo.summary(self.unet,
+                #                      input_data=[latent_model_input, t, text_embeddings],
+                #                      batch_dim=0,
+                #                      col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"),
+                #                      depth=100, verbose=1)
+                #    exit(0)
+
                 # predict the noise residual
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
                 # noise_pred = []
