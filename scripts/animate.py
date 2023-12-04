@@ -74,7 +74,7 @@ def main(args):
                 dreambooth_model_path      = model_config.get("dreambooth_path", ""),
                 lora_model_path            = model_config.get("lora_model_path", ""),
                 lora_alpha                 = model_config.get("lora_alpha", 0.8),
-            ).to("cuda")
+            ).to("cuda").to(torch.float16)
 
             prompts      = model_config.prompt
             n_prompts    = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
