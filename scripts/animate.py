@@ -24,8 +24,14 @@ import csv, pdb, glob
 import math
 from pathlib import Path
 
+from codetiming import Timer
+from timer_utils import FancyTimer
+
 
 def main(args):
+    prof = True
+    prof_rounds = 2
+
     *_, func_args = inspect.getargvalues(inspect.currentframe())
     func_args = dict(func_args)
     
@@ -56,6 +62,7 @@ def main(args):
             pipeline = AnimationPipeline(
                 vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
                 scheduler=DDIMScheduler(**OmegaConf.to_container(inference_config.noise_scheduler_kwargs)),
+                prof=prof,
             ).to("cuda")
 
             pipeline = load_weights(
@@ -78,7 +85,8 @@ def main(args):
             
             config[config_key].random_seed = []
             for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
-                
+                if prof and prompt_idx == 2: FancyTimer.start_profiling()
+
                 # manually set random seed for reproduction
                 if random_seed != -1: torch.manual_seed(random_seed)
                 else: torch.seed()
@@ -102,6 +110,13 @@ def main(args):
                 print(f"save to {savedir}/sample/{prompt}.gif")
                 
                 sample_idx += 1
+
+                if prof and prompt_idx == 2+prof_rounds-1: FancyTimer.stop_profiling()
+
+    if prof:
+        for t in Timer.timers:
+            avg_time = Timer.timers.mean(t)*1000
+            print('{}\t {:.4f} ms\t\t{}'.format(t, avg_time, Timer.timers.count(t)))
 
     samples = torch.concat(samples)
     save_videos_grid(samples, f"{savedir}/sample.gif", n_rows=4)

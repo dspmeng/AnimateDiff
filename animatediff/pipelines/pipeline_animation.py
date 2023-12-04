@@ -29,6 +29,8 @@ from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
 
+from timer_utils import FancyTimer
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -55,6 +57,7 @@ class AnimationPipeline(DiffusionPipeline):
             EulerAncestralDiscreteScheduler,
             DPMSolverMultistepScheduler,
         ],
+        prof=False,
     ):
         super().__init__()
 
@@ -114,6 +117,12 @@ class AnimationPipeline(DiffusionPipeline):
             scheduler=scheduler,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+
+        self.prof = prof
+        if prof: self.t_prepare = FancyTimer(name='prepare', logger=None)
+        if prof: self.t_denoise = FancyTimer(name='denoise', logger=None)
+        if prof: self.t_decode = FancyTimer(name='decode', logger=None)
+
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -332,6 +341,8 @@ class AnimationPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         **kwargs,
     ):
+        if self.prof: self.t_prepare.tick()
+
         # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -383,6 +394,10 @@ class AnimationPipeline(DiffusionPipeline):
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        if self.prof: self.t_prepare.tock()
+
+        if self.prof: self.t_denoise.tick()
+
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -425,8 +440,14 @@ class AnimationPipeline(DiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
+        if self.prof: self.t_denoise.tock()
+
+        if self.prof: self.t_decode.tick()
+
         # Post-processing
         video = self.decode_latents(latents)
+
+        if self.prof: self.t_decode.tock()
 
         # Convert to tensor
         if output_type == "tensor":
