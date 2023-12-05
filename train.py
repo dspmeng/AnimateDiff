@@ -39,6 +39,9 @@ from animatediff.models.unet import UNet3DConditionModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
 from animatediff.utils.util import save_videos_grid, zero_rank_print
 
+from codetiming import Timer
+from timer_utils import FancyTimer
+
 
 
 def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
@@ -313,6 +316,10 @@ def main(
         unet.train()
         
         for step, batch in enumerate(train_dataloader):
+            if prof and global_step == 10:
+                print('start at', global_step)
+                FancyTimer.start_profiling()
+
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
                 
@@ -334,6 +341,7 @@ def main(
             # Convert videos to latent space            
             pixel_values = batch["pixel_values"].to(local_rank)
             video_length = pixel_values.shape[1]
+            if prof: t_vae_enc.tick()
             with torch.no_grad():
                 if not image_finetune:
                     pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
@@ -345,7 +353,9 @@ def main(
                     latents = latents.sample()
 
                 latents = latents * 0.18215
+            if prof: t_vae_enc.tock()
 
+            if prof: t_add_noise.tick()
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
@@ -357,13 +367,16 @@ def main(
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            if prof: t_add_noise.tock()
             
             # Get the text embedding for conditioning
+            if prof: t_tokenizer.tick()
             with torch.no_grad():
                 prompt_ids = tokenizer(
                     batch['text'], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
                 ).input_ids.to(latents.device)
                 encoder_hidden_states = text_encoder(prompt_ids)[0]
+            if prof: t_tokenizer.tock()
                 
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
@@ -376,12 +389,19 @@ def main(
             # Predict the noise residual and compute loss
             # Mixed-precision training
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
+                if prof: t_unet.tick()
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                if prof: t_unet.tock()
+                if prof: t_loss.tick()
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                if prof: t_loss.tock()
 
+            if prof: t_optmizer.tick()
             optimizer.zero_grad()
+            if prof: t_optmizer.tock()
 
             # Backpropagate
+            if prof: t_backward.tick()
             if mixed_precision_training:
                 scaler.scale(loss).backward()
                 """ >>> gradient clipping >>> """
@@ -396,9 +416,15 @@ def main(
                 torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
                 """ <<< gradient clipping <<< """
                 optimizer.step()
+            if prof: t_backward.tock()
 
             lr_scheduler.step()
             progress_bar.update(1)
+ 
+            if prof and global_step == 10+prof_rounds-1: 
+                print('stop at', global_step)
+                FancyTimer.stop_profiling()
+
             global_step += 1
             
             ### <<<< Training <<<< ###
@@ -422,7 +448,7 @@ def main(
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
                 
             # Periodically validation
-            if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
+            if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple) and not prof:
                 samples = []
                 
                 generator = torch.Generator(device=latents.device)
@@ -472,11 +498,16 @@ def main(
                 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
-            
+
             if global_step >= max_train_steps:
                 break
             
     dist.destroy_process_group()
+
+    if prof:
+        for t in Timer.timers:
+            avg_time = Timer.timers.mean(t)*1000
+            print('{}\t {:.4f} ms\t\t{}'.format(t, avg_time, Timer.timers.count(t)))
 
 
 
@@ -489,5 +520,15 @@ if __name__ == "__main__":
 
     name   = Path(args.config).stem
     config = OmegaConf.load(args.config)
+
+    prof = True
+    prof_rounds = 2
+    if prof: t_vae_enc = FancyTimer(name='vae_encode', logger=None)
+    if prof: t_add_noise = FancyTimer(name='add_noise', logger=None)
+    if prof: t_tokenizer = FancyTimer(name='tokenizer', logger=None)
+    if prof: t_unet = FancyTimer(name='unet', logger=None)
+    if prof: t_loss = FancyTimer(name='loss', logger=None)
+    if prof: t_optmizer = FancyTimer(name='optimizer', logger=None)
+    if prof: t_backward = FancyTimer(name='backward', logger=None)
 
     main(name=name, launcher=args.launcher, use_wandb=args.wandb, **config)
