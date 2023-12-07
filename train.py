@@ -320,6 +320,8 @@ def main(
                 print('start at', global_step)
                 FancyTimer.start_profiling()
 
+            if prof: t_trainstep.tick()
+
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
                 
@@ -495,6 +497,8 @@ def main(
                     torchvision.utils.save_image(samples, save_path, nrow=4)
 
                 logging.info(f"Saved samples to {save_path}")
+
+            if prof: t_trainstep.tick()
                 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -521,7 +525,7 @@ if __name__ == "__main__":
     name   = Path(args.config).stem
     config = OmegaConf.load(args.config)
 
-    prof = True
+    prof = False
     prof_rounds = 2
     if prof: t_vae_enc = FancyTimer(name='vae_encode', logger=None)
     if prof: t_add_noise = FancyTimer(name='add_noise', logger=None)
@@ -530,5 +534,6 @@ if __name__ == "__main__":
     if prof: t_loss = FancyTimer(name='loss', logger=None)
     if prof: t_optmizer = FancyTimer(name='optimizer', logger=None)
     if prof: t_backward = FancyTimer(name='backward', logger=None)
+    if prof: t_trainstep = FancyTimer(name='trainstep', logger=None)
 
     main(name=name, launcher=args.launcher, use_wandb=args.wandb, **config)
