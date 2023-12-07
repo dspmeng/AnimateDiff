@@ -58,6 +58,7 @@ class AnimationPipeline(DiffusionPipeline):
             DPMSolverMultistepScheduler,
         ],
         prof=False,
+        export_onnx=False,
     ):
         super().__init__()
 
@@ -118,10 +119,11 @@ class AnimationPipeline(DiffusionPipeline):
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
+        self.export_onnx = export_onnx
         self.prof = prof
-        if prof: self.t_prepare = FancyTimer(name='prepare', logger=None)
-        if prof: self.t_denoise = FancyTimer(name='denoise', logger=None)
-        if prof: self.t_decode = FancyTimer(name='decode', logger=None)
+        if prof: self.t_textenc = FancyTimer(name='text-encode', logger=None)
+        if prof: self.t_denoise = FancyTimer(name='unet-denoise', logger=None)
+        if prof: self.t_decode = FancyTimer(name='vae-decode', logger=None)
 
 
     def enable_vae_slicing(self):
@@ -181,10 +183,33 @@ class AnimationPipeline(DiffusionPipeline):
         else:
             attention_mask = None
 
+        if self.export_onnx:
+            opset = 14
+            input_ids = torch.randint(50000, (1, 77)).to(device=device, dtype=torch.int32)
+            print('exporting onnx text_encoder')
+            torch.onnx.export(self.text_encoder,
+                (input_ids),
+                f'onnx_L8/animatediff.textencoder.L8.opset{opset}.onnx',
+                input_names=['input_ids'],
+                output_names=['outputs'],
+                export_params=True,
+                opset_version=opset,
+                do_constant_folding=True,
+                #dynamic_axes={
+                #                 'latent': {0: 'batch_size'},
+                #                 'timestep': {0: 'batch_size'},
+                #                 'image': {0: 'batch_size'},
+                #             }
+            )
+
+        if self.prof: self.t_textenc.tick()
+
         text_embeddings = self.text_encoder(
             text_input_ids.to(device),
             attention_mask=attention_mask,
         )
+
+        if self.prof: self.t_textenc.tock()
         text_embeddings = text_embeddings[0]
 
         # duplicate text embeddings for each generation per prompt, using mps friendly method
@@ -227,10 +252,12 @@ class AnimationPipeline(DiffusionPipeline):
             else:
                 attention_mask = None
 
+            if self.prof: self.t_textenc.tick()
             uncond_embeddings = self.text_encoder(
                 uncond_input.input_ids.to(device),
                 attention_mask=attention_mask,
             )
+            if self.prof: self.t_textenc.tock()
             uncond_embeddings = uncond_embeddings[0]
 
             # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
@@ -252,7 +279,30 @@ class AnimationPipeline(DiffusionPipeline):
         # video = self.vae.decode(latents).sample
         video = []
         for frame_idx in tqdm(range(latents.shape[0])):
+            if self.prof: self.t_decode.tick()
             video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
+            if self.prof: self.t_decode.tock()
+
+        if self.export_onnx:
+            opset = 14
+            vae_decoder = self.vae
+            vae_decoder.forward = vae_decoder.decode
+            print('exporting onnx vae_decoder ....')
+            torch.onnx.export(vae_decoder,
+                latents[0:1],
+                f'onnx_L8/animatediff.vae.L8.opset{opset}.onnx',
+                input_names=['latents'],
+                output_names=['outputs'],
+                export_params=True,
+                opset_version=opset,
+                do_constant_folding=True,
+                #dynamic_axes={
+                #                 'latent': {0: 'batch_size'},
+                #                 'timestep': {0: 'batch_size'},
+                #                 'image': {0: 'batch_size'},
+                #             }
+            )
+
         video = torch.cat(video)
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
@@ -341,8 +391,6 @@ class AnimationPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         **kwargs,
     ):
-        if self.prof: self.t_prepare.tick()
-
         # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -394,10 +442,6 @@ class AnimationPipeline(DiffusionPipeline):
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        if self.prof: self.t_prepare.tock()
-
-        if self.prof: self.t_denoise.tick()
-
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -407,17 +451,38 @@ class AnimationPipeline(DiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 #if i == 0:
-                #    print(self.unet)
-                #    import torchinfo
-                #    torchinfo.summary(self.unet,
-                #                      input_data=[latent_model_input, t, text_embeddings],
-                #                      batch_dim=0,
-                #                      col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"),
-                #                      depth=100, verbose=1)
-                #    exit(0)
+                #    #print(self.unet)
+                #    #import torchinfo
+                #    #torchinfo.summary(self.unet,
+                #    #                  input_data=[latent_model_input, t, text_embeddings],
+                #    #                  batch_dim=0,
+                #    #                  col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"),
+                #    #                  depth=100, verbose=1)
+
+                if self.export_onnx:
+                    opset = 14
+                    timesteps = t.expand(latent_model_input.shape[0])
+                    print('exporting onnx unet ....')
+                    torch.onnx.export(self.unet,
+                        (latent_model_input, timesteps, text_embeddings),
+                        f'onnx_L8/unet/animatediff.unet.L8.opset{opset}.onnx',
+                        input_names=['sample', 'timestep', 'encoder_hidden_stats'],
+                        output_names=['outputs'],
+                        export_params=True,
+                        opset_version=opset,
+                        do_constant_folding=True,
+                        #dynamic_axes={
+                        #                 'latent': {0: 'batch_size'},
+                        #                 'timestep': {0: 'batch_size'},
+                        #                 'image': {0: 'batch_size'},
+                        #             }
+                    )
 
                 # predict the noise residual
+                if self.prof: self.t_denoise.tick()
+
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
+                if self.prof: self.t_denoise.tock()
                 # noise_pred = []
                 # import pdb
                 # pdb.set_trace()
@@ -433,6 +498,10 @@ class AnimationPipeline(DiffusionPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                if self.export_onnx:
+                    self.decode_latents(latents)
+                    print('export onnx DONE')
+                    exit(0)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -440,14 +509,8 @@ class AnimationPipeline(DiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        if self.prof: self.t_denoise.tock()
-
-        if self.prof: self.t_decode.tick()
-
         # Post-processing
         video = self.decode_latents(latents)
-
-        if self.prof: self.t_decode.tock()
 
         # Convert to tensor
         if output_type == "tensor":

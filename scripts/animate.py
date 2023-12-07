@@ -31,6 +31,7 @@ from timer_utils import FancyTimer
 def main(args):
     prof = True
     prof_rounds = 2
+    export_onnx = False
 
     *_, func_args = inspect.getargvalues(inspect.currentframe())
     func_args = dict(func_args)
@@ -63,6 +64,7 @@ def main(args):
                 vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
                 scheduler=DDIMScheduler(**OmegaConf.to_container(inference_config.noise_scheduler_kwargs)),
                 prof=prof,
+                export_onnx=export_onnx,
             ).to("cuda")
 
             pipeline = load_weights(
